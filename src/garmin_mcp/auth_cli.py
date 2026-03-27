@@ -6,7 +6,9 @@ before running the MCP server in non-interactive environments like Claude Deskto
 
 import argparse
 import os
+import re
 import sys
+import time
 import getpass
 
 import requests
@@ -74,6 +76,195 @@ def get_credentials() -> tuple[str, str]:
             raise ValueError("Password is required")
 
     return email, password
+
+
+def _terminal_get_ticket(is_cn: bool) -> str:
+    """Print the Garmin SSO URL to the terminal and capture the SSO ticket via a local callback server.
+
+    Starts a local HTTP server, builds the Garmin SSO sign-in URL with that
+    server as the ``service`` (redirect target), prints the URL so the user
+    can copy it into any browser, and waits for Garmin to redirect the browser
+    back to the local server after a successful login.  The SSO ticket is
+    extracted from the redirect query parameter and returned.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, quote, urlparse
+
+    TICKET_RE = re.compile(
+        r'(?:embed\?ticket=|serviceTicket["\']?\s*:\s*["\'])(ST-[^"\'&\s,}]+)'
+    )
+
+    callback_result: dict[str, str | None] = {"ticket": None}
+
+    class _CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            ticket_list = params.get("ticket")
+            if ticket_list:
+                callback_result["ticket"] = ticket_list[0]
+                body = (
+                    b"<html><body>"
+                    b"<h1>Authentication successful!</h1>"
+                    b"<p>You can close this tab and return to the terminal.</p>"
+                    b"</body></html>"
+                )
+            else:
+                m = TICKET_RE.search(self.path)
+                if m:
+                    callback_result["ticket"] = m.group(1)
+                    body = (
+                        b"<html><body>"
+                        b"<h1>Authentication successful!</h1>"
+                        b"<p>You can close this tab and return to the terminal.</p>"
+                        b"</body></html>"
+                    )
+                else:
+                    body = (
+                        b"<html><body>"
+                        b"<p>Waiting for authentication...</p>"
+                        b"</body></html>"
+                    )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass  # Suppress default HTTP server logging
+
+    # Bind to port 0 so the OS picks an available port, then read it back.
+    server = HTTPServer(("localhost", 0), _CallbackHandler)
+    server.timeout = 1  # Short poll interval so the deadline is checked regularly
+    port = server.server_address[1]
+
+    domain = "garmin.cn" if is_cn else "garmin.com"
+    callback_url = f"http://localhost:{port}/sso/embed"
+    signin_url = (
+        f"https://sso.{domain}/sso/signin"
+        f"?id=gauth-widget"
+        f"&embedWidget=true"
+        f"&gauthHost=https://sso.{domain}/sso"
+        f"&service={quote(callback_url, safe='')}"
+        f"&source={quote(callback_url, safe='')}"
+        f"&redirectAfterAccountLoginUrl={quote(callback_url, safe='')}"
+        f"&redirectAfterAccountCreationUrl={quote(callback_url, safe='')}"
+    )
+
+    print("\n" + "=" * 60)
+    print("Browser Authentication Required")
+    print("=" * 60)
+    print("\nCopy the following URL and open it in your browser to log in to Garmin Connect:\n")
+    print(f"  {signin_url}")
+    print("\nWaiting for authentication (timeout: 5 minutes)...")
+    print("After logging in you can close the browser tab.\n")
+
+    deadline = time.time() + 300  # 5 minutes
+    while callback_result["ticket"] is None and time.time() < deadline:
+        server.handle_request()
+
+    server.server_close()
+
+    if not callback_result["ticket"]:
+        raise RuntimeError(
+            "Authentication timed out — no SSO ticket was captured.\n"
+            "  Make sure you completed the login in the browser window."
+        )
+    return callback_result["ticket"]
+
+
+def browser_authenticate(
+    token_path: str,
+    token_base64_path: str,
+    force_reauth: bool = False,
+    is_cn: bool = False,
+) -> bool:
+    """Authenticate via the user's own browser to bypass Garmin's API rate limiting.
+
+    Prints the Garmin SSO URL to the terminal so the user can copy it into any
+    browser.  A local HTTP server captures the SSO ticket once login completes,
+    and garth's own internals exchange it for OAuth tokens that are saved in the
+    standard locations.
+
+    No additional dependencies are required — only the Python standard library is
+    used (no Playwright / browser binaries needed).
+    """
+    import io
+
+    # Check if existing tokens are still valid (unless forced)
+    if not force_reauth and token_exists(token_path):
+        print(f"\nChecking existing tokens in '{token_path}'...")
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            is_valid, error_msg = validate_tokens(token_path, is_cn=is_cn)
+        finally:
+            sys.stderr = old_stderr
+
+        if is_valid:
+            print("✓ Existing tokens are valid. Authentication not needed.")
+            print("  Use --force-reauth to generate new tokens.")
+            return True
+        else:
+            print(f"✗ Existing tokens are invalid: {error_msg}")
+            print("  Proceeding with browser re-authentication...\n")
+
+    # Open browser (via terminal URL) and capture SSO ticket
+    try:
+        ticket = _terminal_get_ticket(is_cn)
+    except RuntimeError as e:
+        print(f"\n✗ {e}", file=sys.stderr)
+        return False
+
+    print("  ✓ Login successful — ticket captured")
+    print("  Exchanging ticket for OAuth tokens...")
+
+    # Exchange ticket → OAuth1 → OAuth2 using garth internals
+    try:
+        import garth
+        from garth.sso import get_oauth1_token, exchange as exchange_oauth
+
+        client = garth.Client(domain="garmin.cn" if is_cn else "garmin.com")
+        oauth1 = get_oauth1_token(ticket, client)
+        oauth2 = exchange_oauth(oauth1, client)
+        client.configure(oauth1_token=oauth1, oauth2_token=oauth2)
+    except Exception as e:
+        print(f"\n✗ Token exchange failed: {e}", file=sys.stderr)
+        return False
+
+    print("  ✓ OAuth tokens obtained")
+
+    # Save tokens
+    try:
+        client.dump(token_path)
+        print(f"\n✓ OAuth tokens saved to: {os.path.expanduser(token_path)}")
+
+        token_base64 = client.dumps()
+        expanded_base64 = os.path.expanduser(token_base64_path)
+        with open(expanded_base64, "w") as f:
+            f.write(token_base64)
+        print(f"✓ OAuth tokens (base64) saved to: {expanded_base64}")
+    except Exception as e:
+        print(f"\n✗ Failed to save tokens: {e}", file=sys.stderr)
+        return False
+
+    # Verify
+    print("\nVerifying tokens...")
+    try:
+        garmin = Garmin(is_cn=is_cn)
+        garmin.login(token_path)
+        full_name = garmin.get_full_name()
+        print(f"✓ Authentication successful!")
+        print(f"  Logged in as: {full_name}")
+    except Exception:
+        print("✓ Tokens saved. Run 'garmin-mcp-auth --verify' to confirm.")
+
+    print("\n" + "=" * 60)
+    print("SUCCESS: You can now use the Garmin MCP server!")
+    print("=" * 60)
+    print("\nTokens are valid for approximately 6 months.")
+    return True
 
 
 def authenticate(token_path: str, token_base64_path: str, force_reauth: bool = False, is_cn: bool = False) -> bool:
@@ -261,6 +452,9 @@ Examples:
   # Authenticate and save tokens (interactive)
   garmin-mcp-auth
 
+  # Use browser-based login (bypasses Garmin API rate limiting / 429 errors)
+  garmin-mcp-auth --browser
+
   # Use environment variables for credentials
   GARMIN_EMAIL=you@example.com GARMIN_PASSWORD=secret garmin-mcp-auth
 
@@ -295,6 +489,16 @@ Examples:
     )
 
     parser.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Show the Garmin SSO URL in the terminal to open in any browser. "
+            "Bypasses Garmin API rate limiting (429 errors). "
+            "No extra dependencies required."
+        ),
+    )
+
+    parser.add_argument(
         "--is-cn",
         action="store_true",
         default=None,
@@ -325,7 +529,10 @@ Examples:
         sys.exit(0 if success else 1)
 
     # Authenticate mode
-    success = authenticate(token_path, token_base64_path, args.force_reauth, is_cn)
+    if args.browser:
+        success = browser_authenticate(token_path, token_base64_path, args.force_reauth, is_cn)
+    else:
+        success = authenticate(token_path, token_base64_path, args.force_reauth, is_cn)
     sys.exit(0 if success else 1)
 
 
