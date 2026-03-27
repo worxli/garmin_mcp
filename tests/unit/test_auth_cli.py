@@ -3,6 +3,8 @@
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch, call
 
@@ -13,6 +15,8 @@ from garmin_mcp.auth_cli import (
     get_credentials,
     authenticate,
     verify_tokens,
+    browser_authenticate,
+    _terminal_get_ticket,
     main,
 )
 
@@ -420,3 +424,228 @@ class TestAuthenticateIsCn:
             is_cn=False,
             prompt_mfa=get_mfa,
         )
+
+
+class TestTerminalGetTicket:
+    """Tests for _terminal_get_ticket function."""
+
+    def test_captures_ticket_from_query_param(self):
+        """Test that a ticket in the callback query string is captured and returned."""
+        import queue
+        import urllib.request
+
+        port_queue: queue.Queue[int] = queue.Queue()
+
+        def capturing_print(*args, **kwargs):
+            for arg in args:
+                import re as _re
+                # Port may appear as "localhost:PORT" or URL-encoded "localhost%3APORT"
+                m = _re.search(r"localhost(?::|%3[Aa])(\d+)", str(arg))
+                if m:
+                    port_queue.put(int(m.group(1)))
+
+        ticket = None
+
+        def run_get_ticket():
+            nonlocal ticket
+            ticket = _terminal_get_ticket(is_cn=False)
+
+        with patch("builtins.print", side_effect=capturing_print):
+            t = threading.Thread(target=run_get_ticket, daemon=True)
+            t.start()
+
+            port = port_queue.get(timeout=5)
+
+        url = f"http://localhost:{port}/sso/embed?ticket=ST-test123"
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            body = resp.read()
+            assert b"Authentication successful" in body
+
+        t.join(timeout=3)
+        assert ticket == "ST-test123"
+
+    def test_timeout_raises_runtime_error(self):
+        """Test that a RuntimeError is raised when no ticket is received in time."""
+        # Patch the deadline to be effectively immediate so the test runs fast.
+        with patch("garmin_mcp.auth_cli.time") as mock_time:
+            # time.time() returns a value past the deadline on the first loop check
+            mock_time.time.side_effect = [0, 301]
+            mock_time.sleep = time.sleep  # not used by _terminal_get_ticket
+
+            with pytest.raises(RuntimeError, match="timed out"):
+                _terminal_get_ticket(is_cn=False)
+
+    def test_signin_url_contains_localhost_callback(self, capsys):
+        """Test that the printed URL contains a localhost callback address."""
+        with patch("garmin_mcp.auth_cli.time") as mock_time:
+            mock_time.time.side_effect = [0, 301]
+
+            with pytest.raises(RuntimeError):
+                _terminal_get_ticket(is_cn=False)
+
+        captured = capsys.readouterr()
+        assert "localhost" in captured.out
+        assert "https://sso.garmin.com" in captured.out
+
+    def test_signin_url_uses_garmin_cn_domain(self, capsys):
+        """Test that is_cn=True uses the garmin.cn domain in the URL."""
+        with patch("garmin_mcp.auth_cli.time") as mock_time:
+            mock_time.time.side_effect = [0, 301]
+
+            with pytest.raises(RuntimeError):
+                _terminal_get_ticket(is_cn=True)
+
+        captured = capsys.readouterr()
+        assert "https://sso.garmin.cn" in captured.out
+
+
+class TestBrowserAuthenticate:
+    """Tests for browser_authenticate function."""
+
+    @patch("garmin_mcp.auth_cli.token_exists")
+    @patch("garmin_mcp.auth_cli.validate_tokens")
+    def test_existing_valid_tokens_no_force(self, mock_validate, mock_exists):
+        """Test that valid existing tokens are reused without launching the browser."""
+        mock_exists.return_value = True
+        mock_validate.return_value = (True, "")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = browser_authenticate(tmpdir, f"{tmpdir}/base64", force_reauth=False)
+
+        assert result is True
+        mock_exists.assert_called_once()
+        mock_validate.assert_called_once()
+
+    @patch("garmin_mcp.auth_cli.token_exists")
+    @patch("garmin_mcp.auth_cli.validate_tokens")
+    @patch("garmin_mcp.auth_cli._terminal_get_ticket")
+    def test_invalid_tokens_triggers_browser_flow(self, mock_get_ticket, mock_validate, mock_exists):
+        """Test that invalid tokens trigger the browser-based re-authentication."""
+        mock_exists.return_value = True
+        mock_validate.return_value = (False, "Token expired")
+        mock_get_ticket.side_effect = RuntimeError("timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = browser_authenticate(tmpdir, f"{tmpdir}/base64", force_reauth=False)
+
+        assert result is False
+        mock_get_ticket.assert_called_once_with(False)
+
+    @patch("garmin_mcp.auth_cli.token_exists")
+    @patch("garmin_mcp.auth_cli._terminal_get_ticket")
+    def test_timeout_returns_false(self, mock_get_ticket, mock_exists):
+        """Test that a timeout in ticket capture returns False."""
+        mock_exists.return_value = False
+        mock_get_ticket.side_effect = RuntimeError("Authentication timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = browser_authenticate(tmpdir, f"{tmpdir}/base64")
+
+        assert result is False
+
+    @patch("garmin_mcp.auth_cli.token_exists")
+    @patch("garmin_mcp.auth_cli._terminal_get_ticket")
+    def test_token_exchange_failure_returns_false(self, mock_get_ticket, mock_exists):
+        """Test that a token exchange failure returns False."""
+        mock_exists.return_value = False
+        mock_get_ticket.return_value = "ST-test123"
+
+        mock_garth = Mock()
+        mock_garth.Client.side_effect = Exception("Token exchange failed")
+        mock_garth_sso = Mock()
+
+        with patch.dict("sys.modules", {"garth": mock_garth, "garth.sso": mock_garth_sso}):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = browser_authenticate(tmpdir, f"{tmpdir}/base64")
+
+        assert result is False
+
+    @patch("garmin_mcp.auth_cli.token_exists")
+    @patch("garmin_mcp.auth_cli._terminal_get_ticket")
+    def test_successful_browser_auth(self, mock_get_ticket, mock_exists):
+        """Test a fully successful browser authentication flow."""
+        mock_exists.return_value = False
+        mock_get_ticket.return_value = "ST-test123"
+
+        mock_client = Mock()
+        mock_client.dumps.return_value = "base64tokendata"
+        mock_oauth1 = Mock()
+        mock_oauth2 = Mock()
+
+        mock_garth = Mock()
+        mock_garth.Client.return_value = mock_client
+        mock_garth_sso = Mock()
+        mock_garth_sso.get_oauth1_token.return_value = mock_oauth1
+        mock_garth_sso.exchange.return_value = mock_oauth2
+
+        with patch.dict("sys.modules", {"garth": mock_garth, "garth.sso": mock_garth_sso}):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                base64_path = f"{tmpdir}/base64.txt"
+                result = browser_authenticate(tmpdir, base64_path)
+
+        assert result is True
+        mock_client.dump.assert_called_once_with(tmpdir)
+        mock_client.configure.assert_called_once_with(oauth1_token=mock_oauth1, oauth2_token=mock_oauth2)
+
+
+class TestMainBrowserFlag:
+    """Tests for --browser flag in the main() function."""
+
+    @patch("sys.argv", ["garmin-mcp-auth", "--browser"])
+    @patch("garmin_mcp.auth_cli.browser_authenticate")
+    def test_main_browser_mode_success(self, mock_browser_auth):
+        """Test main function routes to browser_authenticate when --browser is set."""
+        mock_browser_auth.return_value = True
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 0
+        mock_browser_auth.assert_called_once()
+
+    @patch("sys.argv", ["garmin-mcp-auth", "--browser"])
+    @patch("garmin_mcp.auth_cli.browser_authenticate")
+    def test_main_browser_mode_failure(self, mock_browser_auth):
+        """Test main function returns exit code 1 when browser_authenticate fails."""
+        mock_browser_auth.return_value = False
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+
+    @patch("sys.argv", ["garmin-mcp-auth", "--browser", "--force-reauth"])
+    @patch("garmin_mcp.auth_cli.browser_authenticate")
+    def test_main_browser_force_reauth(self, mock_browser_auth):
+        """Test that --force-reauth is forwarded to browser_authenticate."""
+        mock_browser_auth.return_value = True
+
+        with pytest.raises(SystemExit):
+            main()
+
+        assert mock_browser_auth.call_args.args[2] is True
+
+    @patch("sys.argv", ["garmin-mcp-auth", "--browser", "--is-cn"])
+    @patch("garmin_mcp.auth_cli.browser_authenticate")
+    def test_main_browser_is_cn(self, mock_browser_auth):
+        """Test that --is-cn is forwarded to browser_authenticate."""
+        mock_browser_auth.return_value = True
+
+        with pytest.raises(SystemExit):
+            main()
+
+        assert mock_browser_auth.call_args.args[3] is True
+
+    @patch("sys.argv", ["garmin-mcp-auth"])
+    @patch("garmin_mcp.auth_cli.authenticate")
+    @patch("garmin_mcp.auth_cli.browser_authenticate")
+    def test_main_no_browser_flag_uses_authenticate(self, mock_browser_auth, mock_auth):
+        """Test that without --browser the normal authenticate function is used."""
+        mock_auth.return_value = True
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 0
+        mock_auth.assert_called_once()
+        mock_browser_auth.assert_not_called()
